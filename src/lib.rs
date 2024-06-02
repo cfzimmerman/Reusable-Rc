@@ -144,6 +144,7 @@ where
     T: Default + 'static,
 {
     /// Retrieve an immutable reference to the shared data.
+    #[inline]
     pub fn get(&self) -> &T {
         // Safety:
         // See `spawn` for Alignment and Dereferencable.
@@ -353,24 +354,18 @@ mod tests {
         assert_eq!(reu_rc_sl, rr4.get());
     }
 
-    /// Verifies `ReuRc` instances are efficiently reused.
-    ///
-    /// This can be considered flakey because it may nondeterministically
-    /// fail, but the case in which it fails is >1 million heap allocations
-    /// being faster than 1 heap allocation and some pointer copying. That's so
-    /// unlikely that the test is basically deterministic.
-    ///
-    /// Without tuning, the `Rc` time is consistently 2x `ReuRc` time in
-    /// debug mode and 10x in release mode on an aarch64 Mac.
+    /// Verifies allocations are efficiently reused.
     #[test]
-    fn simple_reuse_flaky() {
+    fn simple_reuse() {
         const OBJ_CT: usize = 2_000_000;
         let mut pool: ReuRcPool<usize> = ReuRcPool::new(PoolSizeLimit::Unlimited);
 
         let rc_start = Instant::now();
+
         for num in 0..OBJ_CT {
             let rc = Rc::new(num);
             black_box(rc.clone());
+            black_box(rc);
         }
         let rc_time = rc_start.elapsed();
 
@@ -378,11 +373,13 @@ mod tests {
         for num in 0..OBJ_CT {
             let reu_rc = pool.spawn(|mem| *mem = num);
             black_box(reu_rc.clone());
+            black_box(reu_rc);
         }
         let reu_rc_time = reu_rc_start.elapsed();
 
         println!("Time to {OBJ_CT} allocs: rc: {rc_time:?}, reu_rc: {reu_rc_time:?}");
-        assert!(reu_rc_time.as_nanos() < rc_time.as_nanos());
+        // assert!(reu_rc_time.as_nanos() < rc_time.as_nanos());
+        assert_eq!(pool.pool.borrow().unused.len(), 1);
     }
 
     /// Forces allocations in exceess of the given pool's object limit, verifying
