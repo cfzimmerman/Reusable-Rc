@@ -1,3 +1,59 @@
+//! # Reusable Rcs
+//!
+//! This module contains a generic memory pool for efficiently spawning and
+//! dropping reference-counted heap data at high velocity. Allocations yielded
+//! by the pool can be used like a normal `Rc`, but memory may be returned
+//! to the pool instead of being freed when the final reference is dropped
+//! (see `ReuRcPool::new` for when allocations are not reused).
+//!
+//! Spawned allocations may be new or recycled depending on availability
+//! See `ReuRcPool::spawn` for more details about initializing new `ReuRc` instances.
+//!
+//! Like a `std::rc::Rc`, `ReuRc` has a very cheap `clone` that does not make
+//! any new allocations and only increases the reference count to the underlying
+//! data.
+//!
+//! # Example
+//! ```
+//! use reu_rc::{ReuRcPool, PoolSizeLimit};
+//!
+//! fn main() {
+//!     // ReuRcs from this pool hold a u8 buffer.
+//!     let mut pool: ReuRcPool<Vec<u8>> = ReuRcPool::new(PoolSizeLimit::Unlimited);
+//!
+//!     // Some containers to hold the data.
+//!     let mut vec1 = Vec::with_capacity(100);
+//!     let mut vec2 = Vec::with_capacity(100);
+//!
+//!     // Maybe there are many more cycles.
+//!     for cycle in 0..10 {
+//!         // Maybe we're reading data from a file.
+//!         for data in [cycle; 1000].chunks(10) {
+//!             // Retrieve a buffer and initialize it with our data.
+//!             let buf = pool.spawn(|mem| {
+//!                 mem.resize(data.len(), 0);
+//!                 mem.copy_from_slice(data);
+//!             });
+//!             // Maybe both containers need references to the data.
+//!             vec1.push(buf.clone());
+//!             vec2.push(buf);
+//!         }
+//!
+//!         for (buf1, buf2) in vec1.drain(..).zip(vec2.drain(..)) {
+//!             // Both instances point to the same allocation.
+//!             assert_eq!(buf1.as_ref(), buf2.as_ref());
+//!         }
+//!
+//!         // From the `drain` above, both vectors are now empty, meaning
+//!         // no references exist. That implies the instances of `ReuRc`
+//!         // are no longer in use and have been "deallocated". Because the
+//!         // `PoolSizeLimit` is unlimited, we can assume this memory is
+//!         // reclaimed and reusable. So, every cycle after the first will
+//!         // complete with zero new heap allocations.
+//!     }
+//! }
+//! ```
+
 use std::{
     cell::{Cell, RefCell},
     fmt::Debug,
@@ -8,8 +64,7 @@ use std::{
 
 type PoolRef<T> = Rc<RefCell<ReuRcPoolInner<T>>>;
 
-/// To do: great doc comment with example
-/// Explain default too.
+/// A pool from which to spawn reusable Rcs. See the module documentation for more info.
 pub struct ReuRcPool<T> {
     /// The pool needs to be accessible by every pointer allocated by it, so it's
     /// wrapped in an `Rc` itself. Again, this `Rc` is only for the purpose of
@@ -84,12 +139,19 @@ where
     /// of `T` passed to `init` are UNDEFINED and it is considered Undefined Behavior to
     /// read or copy the preexisting object.
     /// Use `init` only to initialize `T` as if it were a completely new object.
+    ///
+    /// New allocations are defaulted using `T::default`, but whether an allocation is new
+    /// or reused should never affect program correctness and should not be relied on externally.
     //
     // Taking `&self` would compile, but using `&mut self` is more explicit to the caller that
     // we're making mutations.
     pub fn spawn(&mut self, init: impl Fn(&mut T)) -> ReuRc<T> {
-        let reused = self.pool.borrow_mut().unused.pop();
-        let unused_alloc = reused.unwrap_or_else(|| ReuRcInner::new(self.pool.clone()));
+        let unused_alloc = self
+            .pool
+            .borrow_mut()
+            .unused
+            .pop()
+            .unwrap_or_else(|| ReuRcInner::new(self.pool.clone()));
 
         {
             // Safety:
@@ -104,13 +166,9 @@ where
             // In both cases, the pointer we now hold is the only pointer or reference in existence
             // to this piece of data, so there cannot be any immutable references that conflict
             // with this mutable reference.
-            let alloc_mut = unsafe {
-                unused_alloc
-                    .as_mut()
-                    .expect("The allocation pointer should NEVER be null")
-            };
+            let alloc_mut = unsafe { &mut *unused_alloc };
 
-            assert_eq!(
+            debug_assert_eq!(
                 alloc_mut.ref_ct.get(),
                 0,
                 "Nonzero ref count from a new alloc indicates serious Undefined Behavior"
@@ -139,13 +197,12 @@ where
     _alloc: PhantomData<ReuRcInner<T>>,
 }
 
-impl<T> ReuRc<T>
+impl<T> AsRef<T> for ReuRc<T>
 where
     T: Default + 'static,
 {
-    /// Retrieve an immutable reference to the shared data.
     #[inline]
-    pub fn get(&self) -> &T {
+    fn as_ref(&self) -> &T {
         // Safety:
         // See `spawn` for Alignment and Dereferencable.
         // - Initialized: Assuming the data was initialized at the time of `clone`, the reference
@@ -157,13 +214,7 @@ where
         // Because both of those events can only occur when the reference count is zero
         // and the existence of `self` implies that currently it is nonzero, there must
         // only be immutable references to this aligned, dereferencable, and initialized data.
-        unsafe {
-            &self
-                .alloc
-                .as_ref()
-                .expect("The allocation pointer should NEVER be null")
-                .contents
-        }
+        unsafe { &(*self.alloc).contents }
     }
 }
 
@@ -171,6 +222,8 @@ impl<T> Clone for ReuRc<T>
 where
     T: Default + 'static,
 {
+    /// Yields a new reference-counted smart pointer to the shared data. Does not make
+    /// any new allocations.
     fn clone(&self) -> Self {
         // Safety:
         // See `Spawn` for Alignment and Dereferencable.
@@ -184,14 +237,9 @@ where
         // const pointers exist to the `ReuRcInner`. The exclusive mutable pointer is only ever
         // re-created on `Drop`, so there do not exist any mutable references to this data at
         // the same time this const reference exists.
-        {
-            unsafe {
-                self.alloc
-                    .as_ref()
-                    .expect("The allocation pointer should NEVER be null")
-                    .incr_ref_ct();
-            };
-        }
+        unsafe {
+            (*self.alloc).incr_ref_ct();
+        };
         ReuRc {
             alloc: self.alloc,
             _alloc: PhantomData,
@@ -213,11 +261,7 @@ where
             // - Aliasing: Because the reference count is nonzero, the only pointers to the
             // allocation are `const`, meaning that an immutable reference will not exist
             // simultanously with a mutable one.
-            let alloc_ref = unsafe {
-                self.alloc
-                    .as_ref()
-                    .expect("The allocation pointer should NEVER be null")
-            };
+            let alloc_ref = unsafe { &*self.alloc };
             alloc_ref.decr_ref_ct();
             if alloc_ref.ref_ct.get() != 0 {
                 // Other references to this data still exist.
@@ -263,7 +307,7 @@ where
     T: Default + Debug + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.get().fmt(f)
+        self.as_ref().fmt(f)
     }
 }
 
@@ -298,12 +342,7 @@ where
     /// Decreases the reference count on `Self`. This should only ever be called
     /// when a reference to the underlying data is dropped.
     fn decr_ref_ct(&self) {
-        self.ref_ct.set(
-            self.ref_ct
-                .get()
-                .checked_sub(1)
-                .expect("Decreasing a ref ct of zero indicates a major bug and Undefined Behavior"),
-        );
+        self.ref_ct.set(self.ref_ct.get() - 1);
     }
 }
 
@@ -347,11 +386,11 @@ mod tests {
         let rr3 = rr2.clone();
         let rr4 = rr3.clone();
         drop(rr2);
-        let reu_rc_sl = reu_rc.get();
+        let reu_rc_sl = reu_rc.as_ref();
 
         assert_eq!(reu_rc_sl, slice);
-        assert_eq!(reu_rc_sl, rr3.get());
-        assert_eq!(reu_rc_sl, rr4.get());
+        assert_eq!(reu_rc_sl, rr3.as_ref());
+        assert_eq!(reu_rc_sl, rr4.as_ref());
     }
 
     /// Verifies allocations are efficiently reused.
@@ -365,7 +404,7 @@ mod tests {
         for num in 0..OBJ_CT {
             let rc = Rc::new(num);
             black_box(rc.clone());
-            black_box(rc);
+            black_box(rc.as_ref());
         }
         let rc_time = rc_start.elapsed();
 
@@ -373,7 +412,7 @@ mod tests {
         for num in 0..OBJ_CT {
             let reu_rc = pool.spawn(|mem| *mem = num);
             black_box(reu_rc.clone());
-            black_box(reu_rc);
+            black_box(reu_rc.as_ref());
         }
         let reu_rc_time = reu_rc_start.elapsed();
 
@@ -498,7 +537,7 @@ mod tests {
             // the data they're supposed to.
             for map in maps.iter() {
                 for buf in map.values() {
-                    assert_eq!(buf.get(), &expect_entries);
+                    assert_eq!(buf.as_ref(), &expect_entries);
                 }
             }
 
